@@ -11,64 +11,46 @@ from openai import OpenAI
 # -------- Config --------
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
-    # Não quebra no import, só avisa no log
     print("⚠️  OPENAI_API_KEY não setada. Configure no painel do Render.")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-app = FastAPI(title="Audio Transcriber + Behavior Analyzer", version="1.0.0")
+app = FastAPI(title="Audio Transcriber", version="1.0.0")
 
 
-class AnalyzeResponse(BaseModel):
+class TranscriptionResponse(BaseModel):
     language: Optional[str] = None
     raw_transcript: str
-    cleaned_transcript: str
-    summary: str
-    speakers: list[str]
-    questions_by_manager: list[str]
-    common_actions_by_staff: list[str]
-    intents_detected: list[str]
-    recommended_agent_behaviors: list[str]
+    cleaned_transcript: Optional[str] = None
+    summary: Optional[str] = None
 
 
 CLEAN_PROMPT = """
-Você é um assistente que recebe a transcrição (possivelmente ruidosa) de uma ligação de cobrança/visita do Banco Azteca,
-envolvendo um gestor (field manager), um funcionário/atendente e às vezes o cliente.
+Você recebe a transcrição (possivelmente com repetições, ruídos e frases truncadas) de uma ligação em espanhol ou português.
 
 Tarefas:
-1) Limpar o texto: remover ruídos, repetições, preenchimentos ("é...", "ah..."), mantendo o sentido original.
-2) Padronizar nomes dos falantes quando possível: Gestor, Funcionário, Cliente. Se incerto, use "Indefinido".
-3) Produzir um RESUMO objetivo (3-6 linhas).
-4) Extrair LISTAS:
-   - Perguntas recorrentes do Gestor (em bullet points, frases curtas).
-   - Ações ou passos recorrentes do Funcionário/Atendente (em bullets).
-   - Intenções detectadas (ex.: localizar cliente, confirmar endereço, agendar visita, validar referência).
-5) Sugerir 6-10 COMPORTAMENTOS para um Agente Inteligente que ajuda o gestor a encontrar o cliente. Foque em:
-   - Perguntas iniciais de qualificação (endereço, ponto de referência, disponibilidade, telefone alternativo).
-   - Estratégias quando o cliente não atende (contato com vizinho, referência, horário alternativo, replanejamento).
-   - Confirmações e encerramento (rota, landmarks, confirmação de horário, recados).
+1) Gerar uma versão LIMPA do texto, removendo repetições óbvias, interjeições ("ah", "eh", "mmm"), cortes e frases duplicadas, mantendo o sentido.
+2) Produzir um RESUMO curto (3–5 linhas) do que aconteceu na ligação.
 
-Retorne EXCLUSIVAMENTE um JSON com as chaves:
-language, cleaned_transcript, summary, speakers, questions_by_manager, common_actions_by_staff, intents_detected, recommended_agent_behaviors.
+Responda EXCLUSIVAMENTE em JSON com este formato:
+
+{
+  "cleaned_transcript": "...",
+  "summary": "..."
+}
 """
 
-ANALYZE_SYSTEM = (
-    "Você é um analista sênior de operações de campo do Banco Azteca. "
-    "Sempre responda em JSON válido, sem texto extra."
-)
 
-
-@app.post("/transcribe", response_model=AnalyzeResponse)
-async def transcribe_and_analyze(
+@app.post("/transcribe", response_model=TranscriptionResponse)
+async def transcribe(
     file: UploadFile = File(..., description="Arquivo de áudio (.mp3, .m4a, .wav, etc.)"),
-    mode: Literal["clean", "literal"] = Form(default="clean"),
+    mode: Literal["literal", "clean"] = Form(default="literal"),
     language_hint: Optional[str] = Form(
         default=None, description="Opcional: 'es', 'pt', 'en'..."
     ),
 ):
     """
     1) Transcreve o áudio com gpt-4o-mini-transcribe (ou whisper-1 como fallback).
-    2) Se mode='clean', roda uma limpeza + análise com gpt-4o-mini.
-    3) Retorna JSON com transcrição crua, limpa e análises.
+    2) Se mode='clean', gera uma versão limpa + resumo com gpt-4o-mini.
     """
     if not OPENAI_API_KEY:
         raise HTTPException(
@@ -85,15 +67,12 @@ async def transcribe_and_analyze(
                 transcript = client.audio.transcriptions.create(
                     model="gpt-4o-mini-transcribe",
                     file=f,
-                    language=language_hint,  # pode ser None; a API detecta
+                    language=language_hint,
                 )
                 raw_text = transcript.text
                 lang = getattr(transcript, "language", None) or language_hint
             except Exception as e:
-                # Fallback para whisper-1
-                print(
-                    f"⚠️ Falha no gpt-4o-mini-transcribe, tentando whisper-1... ({e})"
-                )
+                print(f"⚠️ Falha no gpt-4o-mini-transcribe, tentando whisper-1... ({e})")
                 f.seek(0)
                 transcript = client.audio.transcriptions.create(
                     model="whisper-1",
@@ -105,67 +84,50 @@ async def transcribe_and_analyze(
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erro ao processar áudio: {e}")
 
-    # Se o usuário só quer literal, não processa análise completa
+    # Se o usuário só quer literal, devolve direto
     if mode == "literal":
         return JSONResponse(
-            content=AnalyzeResponse(
+            content=TranscriptionResponse(
                 language=lang,
                 raw_transcript=raw_text,
-                cleaned_transcript=raw_text,
-                summary="",
-                speakers=[],
-                questions_by_manager=[],
-                common_actions_by_staff=[],
-                intents_detected=[],
-                recommended_agent_behaviors=[],
+                cleaned_transcript=None,
+                summary=None,
             ).model_dump()
         )
 
-    # --- Step 2: Limpeza + Análise (via Chat Completions) ---
+    # --- Step 2: Limpeza simples (opcional) ---
+    cleaned = None
+    summary = None
     try:
         completion = client.chat.completions.create(
             model="gpt-4o-mini",
             response_format={"type": "json_object"},
             messages=[
-                {"role": "system", "content": ANALYZE_SYSTEM},
+                {
+                    "role": "system",
+                    "content": "Você é um assistente que limpa transcrições de áudio e gera resumos curtos.",
+                },
                 {
                     "role": "user",
-                    "content": (
-                        CLEAN_PROMPT
-                        + "\n\n--- TRANSCRIÇÃO BRUTA ---\n"
-                        + raw_text
-                    ),
+                    "content": CLEAN_PROMPT
+                    + "\n\n--- TRANSCRIÇÃO BRUTA ---\n"
+                    + raw_text,
                 },
             ],
         )
-
-        content = completion.choices[0].message.content
-        output = json.loads(content)
-
-        cleaned = (output.get("cleaned_transcript") or "").strip()
-        summary = (output.get("summary") or "").strip()
-        speakers = output.get("speakers", []) or []
-        questions = output.get("questions_by_manager", []) or []
-        actions = output.get("common_actions_by_staff", []) or []
-        intents = output.get("intents_detected", []) or []
-        recs = output.get("recommended_agent_behaviors", []) or []
-
+        data = json.loads(completion.choices[0].message.content)
+        cleaned = data.get("cleaned_transcript")
+        summary = data.get("summary")
     except Exception as e:
-        raise HTTPException(
-            status_code=500, detail=f"Erro ao analisar transcrição: {e}"
-        )
+        # Se der erro na limpeza, ainda assim devolvemos a transcrição bruta
+        print(f"⚠️ Erro ao limpar transcrição: {e}")
 
     return JSONResponse(
-        content=AnalyzeResponse(
+        content=TranscriptionResponse(
             language=lang,
             raw_transcript=raw_text,
-            cleaned_transcript=cleaned or raw_text,
+            cleaned_transcript=cleaned,
             summary=summary,
-            speakers=speakers,
-            questions_by_manager=questions,
-            common_actions_by_staff=actions,
-            intents_detected=intents,
-            recommended_agent_behaviors=recs,
         ).model_dump()
     )
 
